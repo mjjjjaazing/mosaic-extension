@@ -60,7 +60,7 @@ You can use any combination of these AI chatbots:
 
 **Option B — Clone with Git (if you have Git installed):**
 ```bash
-git clone https://github.com/michelhazeen/mosaic-extension.git
+git clone https://github.com/mjjjjaazing/mosaic-extension.git
 ```
 
 ### Step 2: Install in Chrome
