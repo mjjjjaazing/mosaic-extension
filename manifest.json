@@ -1,0 +1,66 @@
+{
+  "manifest_version": 3,
+  "name": "Mosaic — Side-by-Side AI Chat",
+  "version": "2.0.0",
+  "description": "Chat with Gemini, Grok, ChatGPT, Claude, Z.ai, and Kimi side by side in one page. One prompt, all AIs, real-time comparison.",
+  "permissions": [
+    "storage",
+    "tabs",
+    "declarativeNetRequest"
+  ],
+  "host_permissions": [
+    "https://gemini.google.com/*",
+    "https://grok.com/*",
+    "https://chatgpt.com/*",
+    "https://claude.ai/*",
+    "https://chat.z.ai/*",
+    "https://www.kimi.com/*",
+    "https://kimi.moonshot.cn/*",
+    "https://chat.deepseek.com/*",
+    "https://www.perplexity.ai/*",
+    "https://chat.mistral.ai/*"
+  ],
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://gemini.google.com/*",
+        "https://grok.com/*",
+        "https://chatgpt.com/*",
+        "https://claude.ai/*",
+        "https://chat.z.ai/*",
+        "https://www.kimi.com/*",
+        "https://kimi.moonshot.cn/*",
+        "https://chat.deepseek.com/*",
+        "https://www.perplexity.ai/*",
+        "https://chat.mistral.ai/*"
+      ],
+      "js": ["content.js"],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "strip_headers",
+        "enabled": true,
+        "path": "rules.json"
+      }
+    ]
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
