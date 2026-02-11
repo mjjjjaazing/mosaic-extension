@@ -29,6 +29,14 @@
       if (typeof event.data.prompt !== 'string' || event.data.prompt.length > 100000) return;
       injectPrompt(event.data.prompt);
     }
+    if (event.data?.type === 'MOSAIC_EXTRACT_RESPONSE' && event.data?.provider === provider) {
+      const text = extractResponse();
+      event.source.postMessage({
+        type: 'MOSAIC_RESPONSE_DATA',
+        provider: provider,
+        text: text || ''
+      }, event.origin);
+    }
   });
 
   // Also listen via chrome runtime messaging
@@ -213,6 +221,101 @@
       });
     }
     if (btn && !btn.disabled) btn.click();
+  }
+
+  // ===== RESPONSE EXTRACTION =====
+  function extractResponse() {
+    switch (provider) {
+      case 'chatgpt': return extractChatGPT();
+      case 'gemini': return extractGemini();
+      case 'claude': return extractClaude();
+      case 'grok': return extractGrok();
+      case 'zai': return extractZai();
+      case 'kimi': return extractKimi();
+      case 'deepseek': return extractDeepSeek();
+      case 'perplexity': return extractPerplexity();
+      case 'mistral': return extractMistral();
+      default: return extractGeneric();
+    }
+  }
+
+  function getLastElementText(selector) {
+    const els = document.querySelectorAll(selector);
+    if (els.length === 0) return null;
+    return els[els.length - 1].innerText.trim();
+  }
+
+  function extractChatGPT() {
+    return getLastElementText('[data-message-author-role="assistant"] .markdown')
+      || getLastElementText('[data-message-author-role="assistant"]')
+      || extractGeneric();
+  }
+
+  function extractGemini() {
+    return getLastElementText('model-response .markdown')
+      || getLastElementText('model-response')
+      || getLastElementText('.response-content')
+      || extractGeneric();
+  }
+
+  function extractClaude() {
+    return getLastElementText('.font-claude-message')
+      || getLastElementText('[data-is-streaming] .markdown')
+      || getLastElementText('.prose')
+      || extractGeneric();
+  }
+
+  function extractGrok() {
+    return getLastElementText('.message-bubble:last-of-type')
+      || getLastElementText('[class*="assistant"] [class*="markdown"]')
+      || extractGeneric();
+  }
+
+  function extractZai() {
+    return getLastElementText('.assistant-message')
+      || getLastElementText('[class*="botMessage"]')
+      || extractGeneric();
+  }
+
+  function extractKimi() {
+    return getLastElementText('.chat-message-content .markdown')
+      || getLastElementText('.chat-message-content')
+      || extractGeneric();
+  }
+
+  function extractDeepSeek() {
+    return getLastElementText('.ds-markdown')
+      || getLastElementText('[class*="assistant"] .markdown')
+      || extractGeneric();
+  }
+
+  function extractPerplexity() {
+    return getLastElementText('.prose.dark\\:prose-invert')
+      || getLastElementText('[class*="answer"]')
+      || extractGeneric();
+  }
+
+  function extractMistral() {
+    return getLastElementText('.prose')
+      || getLastElementText('[class*="assistant"]')
+      || extractGeneric();
+  }
+
+  function extractGeneric() {
+    // Broad fallback: look for common response containers
+    const selectors = [
+      '[class*="assistant"] [class*="markdown"]',
+      '[class*="response"] [class*="markdown"]',
+      '[class*="message"][class*="bot"]',
+      '[class*="answer"]',
+      '.markdown',
+      '.prose'
+    ];
+    for (const sel of selectors) {
+      const text = getLastElementText(sel);
+      if (text && text.length > 10) return text;
+    }
+    return null;
   }
 
   // ===== UTILITY: Wait for element =====

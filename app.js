@@ -21,17 +21,21 @@ let state = {
   sidebarCollapsed: false
 };
 
+let customTemplates = [];
+
 const providerReady = {};
 
 // ===== INIT =====
 document.addEventListener('DOMContentLoaded', async () => {
   await loadState();
+  await loadCustomTemplates();
   renderSidebar();
   renderPanels();
   setupPromptBar();
   setupLayoutButtons();
   setupSidebarToggle();
   setupFooterButtons();
+  setupHistoryButton();
   listenForReadyMessages();
 });
 
@@ -50,6 +54,8 @@ function saveState() { chrome.storage.local.set({ mosaic_state: state }); }
 // SECURITY: Validate origin of incoming messages
 const ALLOWED_ORIGINS = Object.values(PROVIDERS).map(p => new URL(p.url).origin);
 
+const pendingExtractions = {};
+
 function listenForReadyMessages() {
   window.addEventListener('message', (event) => {
     // Only accept READY messages from known AI provider origins
@@ -57,6 +63,12 @@ function listenForReadyMessages() {
     if (event.data?.type === 'MOSAIC_READY' && typeof event.data.provider === 'string') {
       if (event.data.provider in PROVIDERS) {
         providerReady[event.data.provider] = true;
+      }
+    }
+    if (event.data?.type === 'MOSAIC_RESPONSE_DATA' && typeof event.data.provider === 'string') {
+      if (pendingExtractions[event.data.provider]) {
+        pendingExtractions[event.data.provider](event.data.text || '');
+        delete pendingExtractions[event.data.provider];
       }
     }
   });
@@ -197,6 +209,12 @@ function renderPanels() {
     const headerActions = document.createElement('div');
     headerActions.className = 'panel-header-actions';
 
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'panel-action-btn';
+    copyBtn.title = 'Copy response';
+    copyBtn.textContent = '\uD83D\uDCCB';
+    copyBtn.addEventListener('click', () => copyPanelResponse(pid));
+
     const openBtn = document.createElement('button');
     openBtn.className = 'panel-action-btn';
     openBtn.title = 'Open in new tab';
@@ -208,6 +226,7 @@ function renderPanels() {
     refreshBtn.title = 'Refresh';
     refreshBtn.textContent = '\u21BB';
 
+    headerActions.appendChild(copyBtn);
     headerActions.appendChild(openBtn);
     headerActions.appendChild(refreshBtn);
 
@@ -235,14 +254,36 @@ function setupPromptBar() {
   input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
+      const dropdown = document.querySelector('.template-dropdown');
+      if (dropdown) { dropdown.remove(); return; }
       sendPromptToAll();
+    }
+    if (e.key === 'Escape') {
+      const dropdown = document.querySelector('.template-dropdown');
+      if (dropdown) dropdown.remove();
     }
   });
   sendBtn.addEventListener('click', sendPromptToAll);
   input.addEventListener('input', () => {
     input.style.height = 'auto';
     input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+
+    const val = input.value;
+    if (val === '/' || (val.startsWith('/') && !val.includes(' '))) {
+      showTemplateDropdown(val.slice(1));
+    } else {
+      const dropdown = document.querySelector('.template-dropdown');
+      if (dropdown) dropdown.remove();
+    }
   });
+
+  // Template save button
+  const templateBtn = document.getElementById('templateBtn');
+  if (templateBtn) templateBtn.addEventListener('click', showSaveTemplateDialog);
+
+  // Export button
+  const exportBtn = document.getElementById('exportAllBtn');
+  if (exportBtn) exportBtn.addEventListener('click', exportAllAsMarkdown);
 }
 
 function sendPromptToAll() {
@@ -268,6 +309,7 @@ function sendPromptToAll() {
   input.value = '';
   input.style.height = 'auto';
   savePromptHistory(prompt);
+  showSynthesizeButton();
 }
 
 function savePromptHistory(prompt) {
@@ -276,4 +318,561 @@ function savePromptHistory(prompt) {
     h.unshift({ prompt, timestamp: Date.now(), providers: [...state.activeProviders] });
     chrome.storage.local.set({ prompt_history: h.slice(0, 50) });
   });
+}
+
+// ===== TOAST NOTIFICATION =====
+function showToast(message, isError = false) {
+  let toast = document.querySelector('.mosaic-toast');
+  if (toast) toast.remove();
+  toast = document.createElement('div');
+  toast.className = 'mosaic-toast' + (isError ? ' toast-error' : '');
+  toast.textContent = message;
+  document.body.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add('toast-visible'));
+  setTimeout(() => {
+    toast.classList.remove('toast-visible');
+    setTimeout(() => toast.remove(), 300);
+  }, 2500);
+}
+
+// ===== FEATURE 1: RESPONSE COPY + EXPORT =====
+function requestResponseExtraction(providerId) {
+  return new Promise((resolve) => {
+    const iframe = document.querySelector(`.panel iframe[data-provider="${providerId}"]`);
+    if (!iframe) { resolve(''); return; }
+    const timeout = setTimeout(() => {
+      delete pendingExtractions[providerId];
+      resolve('');
+    }, 5000);
+    pendingExtractions[providerId] = (text) => {
+      clearTimeout(timeout);
+      resolve(text);
+    };
+    try {
+      iframe.contentWindow.postMessage({
+        type: 'MOSAIC_EXTRACT_RESPONSE',
+        provider: providerId
+      }, '*');
+    } catch (e) {
+      clearTimeout(timeout);
+      delete pendingExtractions[providerId];
+      resolve('');
+    }
+  });
+}
+
+async function extractAllResponses() {
+  const results = {};
+  const promises = state.activeProviders.map(async (pid) => {
+    const text = await requestResponseExtraction(pid);
+    if (text) results[pid] = text;
+  });
+  await Promise.all(promises);
+  return results;
+}
+
+async function copyPanelResponse(providerId) {
+  const text = await requestResponseExtraction(providerId);
+  if (!text) {
+    showToast('No response to copy', true);
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(text);
+    showToast('Response copied!');
+  } catch (e) {
+    showToast('Copy failed', true);
+  }
+}
+
+async function exportAllAsMarkdown() {
+  const responses = await extractAllResponses();
+  const entries = Object.entries(responses);
+  if (entries.length === 0) {
+    showToast('No responses to export', true);
+    return;
+  }
+  let md = '# Mosaic AI Responses\n\n';
+  md += `*Exported ${new Date().toLocaleString()}*\n\n---\n\n`;
+  for (const [pid, text] of entries) {
+    const name = PROVIDERS[pid]?.name || pid;
+    md += `## ${name}\n\n${text}\n\n---\n\n`;
+  }
+  try {
+    await navigator.clipboard.writeText(md.trim());
+    showToast(`Exported ${entries.length} response(s) as Markdown!`);
+  } catch (e) {
+    showToast('Export failed', true);
+  }
+}
+
+// ===== FEATURE 2: PROMPT TEMPLATES =====
+const BUILTIN_TEMPLATES = [
+  { id: 'compare', name: 'Compare', category: 'Analysis', prompt: 'Compare and contrast {{topic A}} and {{topic B}}. Include key similarities, differences, pros, and cons.' },
+  { id: 'factcheck', name: 'Fact Check', category: 'Analysis', prompt: 'Fact check the following claim and provide evidence for or against it: {{claim}}' },
+  { id: 'eli5', name: 'ELI5', category: 'Explain', prompt: 'Explain {{topic}} like I\'m 5 years old. Use simple analogies and examples.' },
+  { id: 'codereview', name: 'Code Review', category: 'Code', prompt: 'Review this code for bugs, security issues, and improvements:\n\n```\n{{paste code here}}\n```' },
+  { id: 'proscons', name: 'Pros & Cons', category: 'Analysis', prompt: 'List the pros and cons of {{topic}}. Present as a balanced analysis.' },
+  { id: 'summarize', name: 'Summarize', category: 'Writing', prompt: 'Summarize the following text concisely while keeping the key points:\n\n{{paste text here}}' }
+];
+
+async function loadCustomTemplates() {
+  return new Promise(resolve => {
+    chrome.storage.local.get('mosaic_templates', (data) => {
+      customTemplates = data.mosaic_templates || [];
+      resolve();
+    });
+  });
+}
+
+function saveCustomTemplates() {
+  chrome.storage.local.set({ mosaic_templates: customTemplates });
+}
+
+function showTemplateDropdown(filterText) {
+  let dropdown = document.querySelector('.template-dropdown');
+  if (dropdown) dropdown.remove();
+
+  const filter = filterText.toLowerCase();
+  const builtins = BUILTIN_TEMPLATES.filter(t =>
+    t.name.toLowerCase().includes(filter) || t.category.toLowerCase().includes(filter)
+  );
+  const customs = customTemplates.filter(t =>
+    t.name.toLowerCase().includes(filter)
+  );
+
+  if (builtins.length === 0 && customs.length === 0) return;
+
+  dropdown = document.createElement('div');
+  dropdown.className = 'template-dropdown';
+
+  if (customs.length > 0) {
+    const label = document.createElement('div');
+    label.className = 'template-category-label';
+    label.textContent = 'Custom';
+    dropdown.appendChild(label);
+    for (const t of customs) {
+      const item = document.createElement('div');
+      item.className = 'template-item';
+
+      const nameSpan = document.createElement('span');
+      nameSpan.textContent = t.name;
+
+      const delBtn = document.createElement('button');
+      delBtn.className = 'template-del-btn';
+      delBtn.textContent = '\u00D7';
+      delBtn.title = 'Delete template';
+      delBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        deleteCustomTemplate(t.id);
+      });
+
+      item.appendChild(nameSpan);
+      item.appendChild(delBtn);
+      item.addEventListener('click', () => selectTemplate(t));
+      dropdown.appendChild(item);
+    }
+  }
+
+  // Group builtins by category
+  const categories = {};
+  for (const t of builtins) {
+    if (!categories[t.category]) categories[t.category] = [];
+    categories[t.category].push(t);
+  }
+  for (const [cat, templates] of Object.entries(categories)) {
+    const label = document.createElement('div');
+    label.className = 'template-category-label';
+    label.textContent = cat;
+    dropdown.appendChild(label);
+    for (const t of templates) {
+      const item = document.createElement('div');
+      item.className = 'template-item';
+      item.textContent = t.name;
+      item.addEventListener('click', () => selectTemplate(t));
+      dropdown.appendChild(item);
+    }
+  }
+
+  const promptWrap = document.querySelector('.prompt-input-wrap');
+  promptWrap.appendChild(dropdown);
+}
+
+function selectTemplate(template) {
+  const input = document.getElementById('promptInput');
+  input.value = template.prompt;
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+  input.focus();
+
+  // Select the first placeholder
+  const match = template.prompt.match(/\{\{(.+?)\}\}/);
+  if (match) {
+    const start = template.prompt.indexOf(match[0]);
+    const end = start + match[0].length;
+    input.setSelectionRange(start, end);
+  }
+
+  const dropdown = document.querySelector('.template-dropdown');
+  if (dropdown) dropdown.remove();
+}
+
+function showSaveTemplateDialog() {
+  const input = document.getElementById('promptInput');
+  const currentPrompt = input.value.trim();
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+
+  const title = document.createElement('h3');
+  title.textContent = 'Save as Template';
+  title.style.cssText = 'margin-bottom:12px;font-size:15px;color:var(--text-primary)';
+
+  const nameInput = document.createElement('input');
+  nameInput.className = 'modal-input';
+  nameInput.placeholder = 'Template name';
+
+  const promptArea = document.createElement('textarea');
+  promptArea.className = 'modal-textarea';
+  promptArea.value = currentPrompt;
+  promptArea.placeholder = 'Template prompt (use {{placeholder}} for variables)';
+
+  const actions = document.createElement('div');
+  actions.className = 'modal-actions';
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'modal-btn';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', () => overlay.remove());
+
+  const saveBtn = document.createElement('button');
+  saveBtn.className = 'modal-btn modal-btn-primary';
+  saveBtn.textContent = 'Save';
+  saveBtn.addEventListener('click', () => {
+    const name = nameInput.value.trim();
+    const prompt = promptArea.value.trim();
+    if (!name || !prompt) { showToast('Name and prompt required', true); return; }
+    customTemplates.push({
+      id: 'custom_' + Date.now(),
+      name: name,
+      category: 'Custom',
+      prompt: prompt
+    });
+    saveCustomTemplates();
+    overlay.remove();
+    showToast('Template saved!');
+  });
+
+  actions.appendChild(cancelBtn);
+  actions.appendChild(saveBtn);
+  modal.appendChild(title);
+  modal.appendChild(nameInput);
+  modal.appendChild(promptArea);
+  modal.appendChild(actions);
+  overlay.appendChild(modal);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  document.body.appendChild(overlay);
+  nameInput.focus();
+}
+
+function deleteCustomTemplate(id) {
+  customTemplates = customTemplates.filter(t => t.id !== id);
+  saveCustomTemplates();
+  const dropdown = document.querySelector('.template-dropdown');
+  if (dropdown) dropdown.remove();
+  showToast('Template deleted');
+}
+
+// ===== FEATURE 3: BEST-OF-ALL SYNTHESIZER =====
+function showSynthesizeButton() {
+  if (document.getElementById('synthesizeBtn')) return;
+  const sendBtn = document.getElementById('sendBtn');
+  const synthBtn = document.createElement('button');
+  synthBtn.id = 'synthesizeBtn';
+  synthBtn.className = 'prompt-bar-btn synthesize-btn';
+  synthBtn.title = 'Synthesize best response';
+  synthBtn.textContent = '\u2697';
+  synthBtn.addEventListener('click', showSynthesizeDialog);
+  sendBtn.parentElement.insertBefore(synthBtn, sendBtn);
+}
+
+async function showSynthesizeDialog() {
+  const responses = await extractAllResponses();
+  const entries = Object.entries(responses);
+  if (entries.length < 2) {
+    showToast('Need responses from at least 2 AIs to synthesize', true);
+    return;
+  }
+
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+
+  const modal = document.createElement('div');
+  modal.className = 'modal';
+
+  const title = document.createElement('h3');
+  title.textContent = 'Synthesize Best Response';
+  title.style.cssText = 'margin-bottom:8px;font-size:15px;color:var(--text-primary)';
+
+  const subtitle = document.createElement('p');
+  subtitle.textContent = `Found ${entries.length} responses. Choose which AI should create the synthesis:`;
+  subtitle.style.cssText = 'margin-bottom:16px;font-size:12px;color:var(--text-secondary)';
+
+  const provList = document.createElement('div');
+  provList.className = 'synth-provider-list';
+
+  for (const pid of state.activeProviders) {
+    const p = PROVIDERS[pid];
+    if (!p) continue;
+    const option = document.createElement('div');
+    option.className = 'synth-provider-option';
+
+    const icon = document.createElement('div');
+    icon.className = 'panel-provider-icon';
+    icon.setAttribute('style', `background:${p.color}${p.darkIcon ? ';color:#000' : ''};width:24px;height:24px;border-radius:6px;font-size:11px`);
+    icon.textContent = p.icon;
+
+    const name = document.createElement('span');
+    name.textContent = p.name;
+    name.style.cssText = 'font-size:13px;font-weight:500';
+
+    option.appendChild(icon);
+    option.appendChild(name);
+    option.addEventListener('click', () => {
+      overlay.remove();
+      executeSynthesis(pid, responses);
+    });
+    provList.appendChild(option);
+  }
+
+  const cancelBtn = document.createElement('button');
+  cancelBtn.className = 'modal-btn';
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.style.cssText = 'margin-top:12px;width:100%';
+  cancelBtn.addEventListener('click', () => overlay.remove());
+
+  modal.appendChild(title);
+  modal.appendChild(subtitle);
+  modal.appendChild(provList);
+  modal.appendChild(cancelBtn);
+  overlay.appendChild(modal);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+  document.body.appendChild(overlay);
+}
+
+function executeSynthesis(targetPid, responses) {
+  let metaPrompt = 'I asked multiple AI assistants the same question. Please synthesize the best parts of their answers into one comprehensive, well-structured response.\n\n';
+  for (const [pid, text] of Object.entries(responses)) {
+    const name = PROVIDERS[pid]?.name || pid;
+    metaPrompt += `--- ${name} ---\n${text}\n\n`;
+  }
+  metaPrompt += '---\n\nPlease create a synthesized answer that combines the best insights, corrects any errors, and presents a unified, comprehensive response.';
+
+  const iframe = document.querySelector(`.panel iframe[data-provider="${targetPid}"]`);
+  if (!iframe) { showToast('Target panel not found', true); return; }
+  try {
+    iframe.contentWindow.postMessage({
+      type: 'MOSAIC_INJECT_PROMPT',
+      provider: targetPid,
+      prompt: metaPrompt
+    }, '*');
+    showToast(`Synthesis sent to ${PROVIDERS[targetPid]?.name || targetPid}`);
+  } catch (e) {
+    showToast('Synthesis failed', true);
+  }
+}
+
+// ===== FEATURE 4: CONVERSATION HISTORY + SEARCH =====
+function setupHistoryButton() {
+  const historyBtn = document.getElementById('historyBtn');
+  if (historyBtn) {
+    historyBtn.addEventListener('click', showHistoryPanel);
+  }
+  // Keyboard shortcut: Ctrl/Cmd + H
+  document.addEventListener('keydown', (e) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'h') {
+      e.preventDefault();
+      showHistoryPanel();
+    }
+  });
+}
+
+function showHistoryPanel() {
+  // Remove if already open
+  let existing = document.querySelector('.history-overlay');
+  if (existing) { existing.remove(); return; }
+
+  const overlay = document.createElement('div');
+  overlay.className = 'history-overlay';
+
+  const panel = document.createElement('div');
+  panel.className = 'history-panel';
+
+  const header = document.createElement('div');
+  header.style.cssText = 'display:flex;align-items:center;justify-content:space-between;padding:16px;border-bottom:1px solid var(--border)';
+
+  const title = document.createElement('h3');
+  title.textContent = 'Prompt History';
+  title.style.cssText = 'font-size:15px;font-weight:600;color:var(--text-primary)';
+
+  const closeBtn = document.createElement('button');
+  closeBtn.className = 'panel-action-btn';
+  closeBtn.textContent = '\u2715';
+  closeBtn.style.cssText = 'font-size:16px;width:28px;height:28px';
+  closeBtn.addEventListener('click', () => overlay.remove());
+
+  header.appendChild(title);
+  header.appendChild(closeBtn);
+
+  const searchInput = document.createElement('input');
+  searchInput.className = 'history-search';
+  searchInput.placeholder = 'Search prompts...';
+  searchInput.type = 'text';
+
+  const listContainer = document.createElement('div');
+  listContainer.className = 'history-list';
+
+  const footer = document.createElement('div');
+  footer.className = 'history-footer';
+  const clearBtn = document.createElement('button');
+  clearBtn.className = 'modal-btn';
+  clearBtn.textContent = 'Clear All History';
+  clearBtn.style.cssText = 'width:100%;font-size:11px;color:#ef4444';
+  clearBtn.addEventListener('click', () => {
+    chrome.storage.local.set({ prompt_history: [] });
+    renderHistoryList(listContainer, [], '');
+    showToast('History cleared');
+  });
+  footer.appendChild(clearBtn);
+
+  panel.appendChild(header);
+  panel.appendChild(searchInput);
+  panel.appendChild(listContainer);
+  panel.appendChild(footer);
+  overlay.appendChild(panel);
+  overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+
+  document.body.appendChild(overlay);
+  searchInput.focus();
+
+  // Load history
+  chrome.storage.local.get('prompt_history', (data) => {
+    const history = data.prompt_history || [];
+    renderHistoryList(listContainer, history, '');
+
+    searchInput.addEventListener('input', () => {
+      renderHistoryList(listContainer, history, searchInput.value.trim().toLowerCase());
+    });
+  });
+}
+
+function renderHistoryList(container, history, searchTerm) {
+  container.innerHTML = '';
+  const filtered = searchTerm
+    ? history.filter(h => h.prompt.toLowerCase().includes(searchTerm))
+    : history;
+
+  if (filtered.length === 0) {
+    const empty = document.createElement('div');
+    empty.style.cssText = 'padding:32px;text-align:center;color:var(--text-muted);font-size:13px';
+    empty.textContent = searchTerm ? 'No matching prompts' : 'No prompt history yet';
+    container.appendChild(empty);
+    return;
+  }
+
+  for (const entry of filtered) {
+    const item = document.createElement('div');
+    item.className = 'history-item';
+
+    const promptText = document.createElement('div');
+    promptText.style.cssText = 'font-size:13px;color:var(--text-primary);line-height:1.4;word-break:break-word';
+    promptText.textContent = entry.prompt.length > 200 ? entry.prompt.slice(0, 200) + '...' : entry.prompt;
+
+    const meta = document.createElement('div');
+    meta.className = 'history-item-meta';
+    const providers = (entry.providers || []).map(p => PROVIDERS[p]?.name || p).join(', ');
+    meta.textContent = `${formatTimestamp(entry.timestamp)}${providers ? ' \u00B7 ' + providers : ''}`;
+
+    const actions = document.createElement('div');
+    actions.className = 'history-item-actions';
+
+    const resendBtn = document.createElement('button');
+    resendBtn.className = 'panel-action-btn';
+    resendBtn.title = 'Resend';
+    resendBtn.textContent = '\u21BB';
+    resendBtn.style.cssText = 'font-size:14px';
+    resendBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      resendPrompt(entry.prompt);
+      const overlay = document.querySelector('.history-overlay');
+      if (overlay) overlay.remove();
+    });
+
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'panel-action-btn';
+    copyBtn.title = 'Copy';
+    copyBtn.textContent = '\uD83D\uDCCB';
+    copyBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      navigator.clipboard.writeText(entry.prompt).then(() => showToast('Prompt copied!'));
+    });
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'panel-action-btn';
+    delBtn.title = 'Delete';
+    delBtn.textContent = '\u2715';
+    delBtn.style.cssText = 'font-size:12px;color:#ef4444';
+    delBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      deleteHistoryEntry(entry.timestamp, container);
+    });
+
+    actions.appendChild(resendBtn);
+    actions.appendChild(copyBtn);
+    actions.appendChild(delBtn);
+
+    item.appendChild(promptText);
+    item.appendChild(meta);
+    item.appendChild(actions);
+
+    item.addEventListener('click', () => {
+      resendPrompt(entry.prompt);
+      const overlay = document.querySelector('.history-overlay');
+      if (overlay) overlay.remove();
+    });
+
+    container.appendChild(item);
+  }
+}
+
+function resendPrompt(prompt) {
+  const input = document.getElementById('promptInput');
+  input.value = prompt;
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+  input.focus();
+}
+
+function deleteHistoryEntry(timestamp, container) {
+  chrome.storage.local.get('prompt_history', (data) => {
+    const h = (data.prompt_history || []).filter(e => e.timestamp !== timestamp);
+    chrome.storage.local.set({ prompt_history: h });
+    renderHistoryList(container, h, '');
+    showToast('Entry deleted');
+  });
+}
+
+function formatTimestamp(ts) {
+  const diff = Date.now() - ts;
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  return new Date(ts).toLocaleDateString();
 }
