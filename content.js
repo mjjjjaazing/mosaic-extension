@@ -26,8 +26,14 @@
     // Only accept messages from the extension's own origin (chrome-extension://...)
     if (!event.origin.startsWith('chrome-extension://')) return;
     if (event.data?.type === 'MOSAIC_INJECT_PROMPT' && event.data?.provider === provider) {
-      if (typeof event.data.prompt !== 'string' || event.data.prompt.length > 100000) return;
-      injectPrompt(event.data.prompt);
+      const prompt = event.data.prompt;
+      if (typeof prompt !== 'string' || prompt.length > 100000) return;
+      // Route to image+prompt handler if images are present
+      if (Array.isArray(event.data.images) && event.data.images.length > 0 && validateImagePayload(event.data.images)) {
+        injectImagesAndPrompt(event.data.images, prompt);
+      } else {
+        injectPrompt(prompt);
+      }
     }
     if (event.data?.type === 'MOSAIC_EXTRACT_RESPONSE' && event.data?.provider === provider) {
       const text = extractResponse();
@@ -45,7 +51,11 @@
     chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (message.type === 'MOSAIC_INJECT_PROMPT' && message.provider === provider) {
         if (typeof message.prompt !== 'string' || message.prompt.length > 100000) return false;
-        injectPrompt(message.prompt);
+        if (Array.isArray(message.images) && message.images.length > 0 && validateImagePayload(message.images)) {
+          injectImagesAndPrompt(message.images, message.prompt);
+        } else {
+          injectPrompt(message.prompt);
+        }
         sendResponse({ success: true });
       }
       return false;
@@ -55,8 +65,9 @@
   // Notify parent that content script is ready
   // SECURITY: Target extension origin specifically
   try {
-    if (window.parent !== window) {
-      window.parent.postMessage({ type: 'MOSAIC_READY', provider }, '*');
+    if (window.parent !== window && chrome?.runtime?.id) {
+      const extensionOrigin = 'chrome-extension://' + chrome.runtime.id;
+      window.parent.postMessage({ type: 'MOSAIC_READY', provider }, extensionOrigin);
     }
   } catch(e) {}
 
@@ -221,6 +232,117 @@
       });
     }
     if (btn && !btn.disabled) btn.click();
+  }
+
+  // ===== IMAGE INJECTION =====
+  const IMAGE_MAX_COUNT = 4;
+  const IMAGE_MAX_SIZE = 14 * 1024 * 1024; // ~13.3MB base64 ceiling
+  const IMAGE_ALLOWED = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+
+  function validateImagePayload(images) {
+    if (!Array.isArray(images) || images.length === 0 || images.length > IMAGE_MAX_COUNT) return false;
+    return images.every(img =>
+      typeof img.dataUrl === 'string' &&
+      img.dataUrl.startsWith('data:image/') &&
+      img.dataUrl.length < IMAGE_MAX_SIZE &&
+      IMAGE_ALLOWED.includes(img.mimeType)
+    );
+  }
+
+  function dataUrlToFile(dataUrl, filename, mimeType) {
+    const [header, b64] = dataUrl.split(',');
+    if (!header || !b64) return null;
+    try {
+      const binary = atob(b64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+      const blob = new Blob([bytes], { type: mimeType });
+      return new File([blob], filename, { type: mimeType });
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function dispatchSyntheticPaste(element, files) {
+    const dt = new DataTransfer();
+    files.forEach(f => dt.items.add(f));
+    element.focus();
+    const event = new ClipboardEvent('paste', {
+      bubbles: true,
+      cancelable: true,
+      clipboardData: dt
+    });
+    element.dispatchEvent(event);
+  }
+
+  function dispatchSyntheticDrop(element, files) {
+    const dt = new DataTransfer();
+    files.forEach(f => dt.items.add(f));
+    element.dispatchEvent(new DragEvent('dragenter', { bubbles: true, dataTransfer: dt }));
+    element.dispatchEvent(new DragEvent('dragover', { bubbles: true, dataTransfer: dt }));
+    element.dispatchEvent(new DragEvent('drop', { bubbles: true, cancelable: true, dataTransfer: dt }));
+  }
+
+  function getInputSelector() {
+    switch (provider) {
+      case 'chatgpt':    return '#prompt-textarea';
+      case 'gemini':     return '.ql-editor[contenteditable="true"]';
+      case 'claude':     return '.ProseMirror[contenteditable="true"], div[aria-label="Write your prompt to Claude"]';
+      case 'grok':       return '.tiptap.ProseMirror[contenteditable="true"]';
+      case 'zai':        return '#chat-input, textarea';
+      case 'kimi':       return '.chat-input-editor[contenteditable="true"]';
+      case 'deepseek':   return 'textarea';
+      case 'perplexity': return 'textarea';
+      case 'mistral':    return 'textarea';
+      default:           return '[contenteditable="true"][role="textbox"], textarea';
+    }
+  }
+
+  function getImageDropTarget() {
+    // Some providers handle drop on a wrapper rather than the textarea itself
+    switch (provider) {
+      case 'deepseek':   return document.querySelector('.chat-input-container') || document.querySelector('textarea');
+      case 'perplexity': return document.querySelector('[class*="input"]') || document.querySelector('textarea');
+      case 'mistral':    return document.querySelector('[class*="chat-input"]') || document.querySelector('textarea');
+      default:           return null;
+    }
+  }
+
+  function injectImagesAndPrompt(images, prompt) {
+    // Convert base64 data URLs to File objects
+    const files = [];
+    for (const img of images) {
+      const file = dataUrlToFile(img.dataUrl, img.name || 'image.png', img.mimeType);
+      if (file) files.push(file);
+    }
+    if (files.length === 0) {
+      // No valid files, fall back to text-only
+      if (prompt) injectPrompt(prompt);
+      return;
+    }
+
+    const selector = getInputSelector();
+    waitForElement(selector, (inputEl) => {
+      // Step 1: Dispatch synthetic paste on the input element
+      dispatchSyntheticPaste(inputEl, files);
+
+      // Step 2: For textarea-based providers, also try drop as fallback
+      const dropTarget = getImageDropTarget();
+      if (dropTarget) {
+        setTimeout(() => dispatchSyntheticDrop(dropTarget, files), 300);
+      }
+
+      // Step 3: Wait for provider to process images, then inject text
+      const delay = 1500 + (files.length - 1) * 500;
+      setTimeout(() => {
+        if (prompt) {
+          injectPrompt(prompt);
+        } else {
+          // No text, just click send
+          setTimeout(() => clickSendButton(), 600);
+        }
+      }, delay);
+    });
   }
 
   // ===== RESPONSE EXTRACTION =====

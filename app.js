@@ -23,6 +23,11 @@ let state = {
 
 let customTemplates = [];
 
+let pendingImages = [];
+const MAX_IMAGES = 4;
+const MAX_IMAGE_SIZE = 10 * 1024 * 1024; // 10MB
+const IMAGE_ALLOWED_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+
 const providerReady = {};
 
 // ===== INIT =====
@@ -35,6 +40,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupLayoutButtons();
   setupSidebarToggle();
   setupFooterButtons();
+  setupImageAttachments();
   setupHistoryButton();
   listenForReadyMessages();
 });
@@ -48,7 +54,11 @@ async function loadState() {
     });
   });
 }
-function saveState() { chrome.storage.local.set({ mosaic_state: state }); }
+function saveState() {
+  chrome.storage.local.set({ mosaic_state: state }, () => {
+    if (chrome.runtime.lastError) console.error('Failed to save state:', chrome.runtime.lastError);
+  });
+}
 
 // ===== READY MESSAGES =====
 // SECURITY: Validate origin of incoming messages
@@ -164,6 +174,7 @@ function setupFooterButtons() {
   });
   document.getElementById('refreshAllBtn').addEventListener('click', () => {
     document.querySelectorAll('.panel iframe').forEach(f => { f.src = f.src; });
+    removeSynthesizeButton();
   });
 }
 
@@ -289,18 +300,30 @@ function setupPromptBar() {
 function sendPromptToAll() {
   const input = document.getElementById('promptInput');
   const prompt = input.value.trim();
-  if (!prompt) return;
+  const hasImages = pendingImages.length > 0;
+  if (!prompt && !hasImages) return;
+  if (prompt.length > 100000) { showToast('Prompt too long (max 100,000 characters)', true); return; }
+
+  // Build image payload (base64 data URLs are serializable via postMessage)
+  const images = hasImages ? pendingImages.map(img => ({
+    dataUrl: img.dataUrl,
+    mimeType: img.mimeType,
+    name: img.name
+  })) : undefined;
 
   // Send to each iframe via postMessage — content script listens
   document.querySelectorAll('.panel iframe').forEach(iframe => {
     const pid = iframe.getAttribute('data-provider');
-    if (!pid) return;
+    if (!pid || !PROVIDERS[pid]) return;
+    const targetOrigin = new URL(PROVIDERS[pid].url).origin;
     try {
-      iframe.contentWindow.postMessage({
+      const message = {
         type: 'MOSAIC_INJECT_PROMPT',
         provider: pid,
         prompt: prompt
-      }, '*');
+      };
+      if (images) message.images = images;
+      iframe.contentWindow.postMessage(message, targetOrigin);
     } catch (e) {
       console.warn(`postMessage failed for ${pid}:`, e);
     }
@@ -308,16 +331,149 @@ function sendPromptToAll() {
 
   input.value = '';
   input.style.height = 'auto';
-  savePromptHistory(prompt);
+  savePromptHistory(prompt, hasImages ? pendingImages.length : 0);
+  clearPendingImages();
   showSynthesizeButton();
 }
 
-function savePromptHistory(prompt) {
+let historyWritePending = false;
+const historyQueue = [];
+
+function savePromptHistory(prompt, imageCount = 0) {
+  const entry = { prompt, timestamp: Date.now(), providers: [...state.activeProviders] };
+  if (imageCount > 0) entry.imageCount = imageCount;
+  historyQueue.push(entry);
+  if (historyWritePending) return;
+  historyWritePending = true;
   chrome.storage.local.get('prompt_history', (data) => {
     const h = data.prompt_history || [];
-    h.unshift({ prompt, timestamp: Date.now(), providers: [...state.activeProviders] });
-    chrome.storage.local.set({ prompt_history: h.slice(0, 50) });
+    h.unshift(...historyQueue);
+    historyQueue.length = 0;
+    chrome.storage.local.set({ prompt_history: h.slice(0, 50) }, () => {
+      historyWritePending = false;
+      if (chrome.runtime.lastError) console.error('Failed to save history:', chrome.runtime.lastError);
+    });
   });
+}
+
+// ===== IMAGE ATTACHMENTS =====
+function setupImageAttachments() {
+  const textarea = document.getElementById('promptInput');
+  const imageBtn = document.getElementById('imageBtn');
+  const fileInput = document.getElementById('imageFileInput');
+  const promptWrap = document.getElementById('promptInputWrap');
+
+  // Paste handler on textarea — intercept image items
+  textarea.addEventListener('paste', (e) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+    let hasImage = false;
+    for (const item of items) {
+      if (item.kind === 'file' && IMAGE_ALLOWED_TYPES.includes(item.type)) {
+        hasImage = true;
+        const file = item.getAsFile();
+        if (file) addImageFile(file);
+      }
+    }
+    if (hasImage) e.preventDefault();
+  });
+
+  // File picker button
+  imageBtn.addEventListener('click', () => fileInput.click());
+  fileInput.addEventListener('change', () => {
+    for (const file of fileInput.files) {
+      addImageFile(file);
+    }
+    fileInput.value = '';
+  });
+
+  // Drag & drop on prompt wrap
+  let dragCounter = 0;
+  promptWrap.addEventListener('dragenter', (e) => {
+    e.preventDefault();
+    dragCounter++;
+    promptWrap.classList.add('drag-over');
+  });
+  promptWrap.addEventListener('dragover', (e) => {
+    e.preventDefault();
+  });
+  promptWrap.addEventListener('dragleave', (e) => {
+    e.preventDefault();
+    dragCounter--;
+    if (dragCounter <= 0) {
+      dragCounter = 0;
+      promptWrap.classList.remove('drag-over');
+    }
+  });
+  promptWrap.addEventListener('drop', (e) => {
+    e.preventDefault();
+    dragCounter = 0;
+    promptWrap.classList.remove('drag-over');
+    const files = e.dataTransfer?.files;
+    if (!files) return;
+    for (const file of files) {
+      addImageFile(file);
+    }
+  });
+}
+
+function addImageFile(file) {
+  if (!IMAGE_ALLOWED_TYPES.includes(file.type)) {
+    showToast('Only PNG, JPEG, GIF, and WEBP images are supported', true);
+    return;
+  }
+  if (file.size > MAX_IMAGE_SIZE) {
+    showToast('Image too large (max 10MB)', true);
+    return;
+  }
+  if (pendingImages.length >= MAX_IMAGES) {
+    showToast(`Maximum ${MAX_IMAGES} images per message`, true);
+    return;
+  }
+
+  const reader = new FileReader();
+  reader.onload = () => {
+    pendingImages.push({
+      dataUrl: reader.result,
+      mimeType: file.type,
+      name: file.name || 'image'
+    });
+    renderImagePreviews();
+  };
+  reader.onerror = () => showToast('Failed to read image', true);
+  reader.readAsDataURL(file);
+}
+
+function renderImagePreviews() {
+  const container = document.getElementById('imagePreviewContainer');
+  container.innerHTML = '';
+  pendingImages.forEach((img, idx) => {
+    const item = document.createElement('div');
+    item.className = 'image-preview-item';
+
+    const imgEl = document.createElement('img');
+    imgEl.src = img.dataUrl;
+    imgEl.alt = img.name;
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'image-remove-btn';
+    removeBtn.textContent = '\u00D7';
+    removeBtn.title = 'Remove image';
+    removeBtn.addEventListener('click', () => {
+      pendingImages.splice(idx, 1);
+      renderImagePreviews();
+    });
+
+    item.appendChild(imgEl);
+    item.appendChild(removeBtn);
+    container.appendChild(item);
+  });
+}
+
+function clearPendingImages() {
+  pendingImages = [];
+  const container = document.getElementById('imagePreviewContainer');
+  if (container) container.innerHTML = '';
 }
 
 // ===== TOAST NOTIFICATION =====
@@ -343,16 +499,18 @@ function requestResponseExtraction(providerId) {
     const timeout = setTimeout(() => {
       delete pendingExtractions[providerId];
       resolve('');
-    }, 5000);
+    }, 10000);
     pendingExtractions[providerId] = (text) => {
       clearTimeout(timeout);
       resolve(text);
     };
+    const targetOrigin = PROVIDERS[providerId] ? new URL(PROVIDERS[providerId].url).origin : null;
+    if (!targetOrigin) { clearTimeout(timeout); delete pendingExtractions[providerId]; resolve(''); return; }
     try {
       iframe.contentWindow.postMessage({
         type: 'MOSAIC_EXTRACT_RESPONSE',
         provider: providerId
-      }, '*');
+      }, targetOrigin);
     } catch (e) {
       clearTimeout(timeout);
       delete pendingExtractions[providerId];
@@ -381,11 +539,12 @@ async function copyPanelResponse(providerId) {
     await navigator.clipboard.writeText(text);
     showToast('Response copied!');
   } catch (e) {
-    showToast('Copy failed', true);
+    showToast(e.name === 'NotAllowedError' ? 'Clipboard permission denied' : 'Copy failed', true);
   }
 }
 
 async function exportAllAsMarkdown() {
+  showToast('Extracting responses...');
   const responses = await extractAllResponses();
   const entries = Object.entries(responses);
   if (entries.length === 0) {
@@ -402,7 +561,7 @@ async function exportAllAsMarkdown() {
     await navigator.clipboard.writeText(md.trim());
     showToast(`Exported ${entries.length} response(s) as Markdown!`);
   } catch (e) {
-    showToast('Export failed', true);
+    showToast(e.name === 'NotAllowedError' ? 'Clipboard permission denied' : 'Export failed', true);
   }
 }
 
@@ -426,7 +585,12 @@ async function loadCustomTemplates() {
 }
 
 function saveCustomTemplates() {
-  chrome.storage.local.set({ mosaic_templates: customTemplates });
+  chrome.storage.local.set({ mosaic_templates: customTemplates }, () => {
+    if (chrome.runtime.lastError) {
+      console.error('Failed to save templates:', chrome.runtime.lastError);
+      showToast('Failed to save template', true);
+    }
+  });
 }
 
 function showTemplateDropdown(filterText) {
@@ -496,6 +660,18 @@ function showTemplateDropdown(filterText) {
 
   const promptWrap = document.querySelector('.prompt-input-wrap');
   promptWrap.appendChild(dropdown);
+
+  // Close on click outside
+  setTimeout(() => {
+    const closeOnOutsideClick = (e) => {
+      if (!promptWrap.contains(e.target)) {
+        const dd = document.querySelector('.template-dropdown');
+        if (dd) dd.remove();
+        document.removeEventListener('click', closeOnOutsideClick);
+      }
+    };
+    document.addEventListener('click', closeOnOutsideClick);
+  }, 0);
 }
 
 function selectTemplate(template) {
@@ -552,9 +728,11 @@ function showSaveTemplateDialog() {
   saveBtn.className = 'modal-btn modal-btn-primary';
   saveBtn.textContent = 'Save';
   saveBtn.addEventListener('click', () => {
-    const name = nameInput.value.trim();
+    const name = nameInput.value.trim().slice(0, 100).replace(/[\r\n\t]/g, ' ');
     const prompt = promptArea.value.trim();
     if (!name || !prompt) { showToast('Name and prompt required', true); return; }
+    if (prompt.length > 50000) { showToast('Template prompt too long (max 50,000 chars)', true); return; }
+    if (customTemplates.length >= 50) { showToast('Maximum 50 custom templates reached', true); return; }
     customTemplates.push({
       id: 'custom_' + Date.now(),
       name: name,
@@ -587,6 +765,11 @@ function deleteCustomTemplate(id) {
 }
 
 // ===== FEATURE 3: BEST-OF-ALL SYNTHESIZER =====
+function removeSynthesizeButton() {
+  const btn = document.getElementById('synthesizeBtn');
+  if (btn) btn.remove();
+}
+
 function showSynthesizeButton() {
   if (document.getElementById('synthesizeBtn')) return;
   const sendBtn = document.getElementById('sendBtn');
@@ -674,11 +857,12 @@ function executeSynthesis(targetPid, responses) {
   const iframe = document.querySelector(`.panel iframe[data-provider="${targetPid}"]`);
   if (!iframe) { showToast('Target panel not found', true); return; }
   try {
+    const synthOrigin = new URL(PROVIDERS[targetPid].url).origin;
     iframe.contentWindow.postMessage({
       type: 'MOSAIC_INJECT_PROMPT',
       provider: targetPid,
       prompt: metaPrompt
-    }, '*');
+    }, synthOrigin);
     showToast(`Synthesis sent to ${PROVIDERS[targetPid]?.name || targetPid}`);
   } catch (e) {
     showToast('Synthesis failed', true);
@@ -691,9 +875,9 @@ function setupHistoryButton() {
   if (historyBtn) {
     historyBtn.addEventListener('click', showHistoryPanel);
   }
-  // Keyboard shortcut: Ctrl/Cmd + H
+  // Keyboard shortcut: Ctrl/Cmd + Shift + H
   document.addEventListener('keydown', (e) => {
-    if ((e.ctrlKey || e.metaKey) && e.key === 'h') {
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key === 'h') {
       e.preventDefault();
       showHistoryPanel();
     }
@@ -763,8 +947,12 @@ function showHistoryPanel() {
     const history = data.prompt_history || [];
     renderHistoryList(listContainer, history, '');
 
+    let searchDebounce = null;
     searchInput.addEventListener('input', () => {
-      renderHistoryList(listContainer, history, searchInput.value.trim().toLowerCase());
+      clearTimeout(searchDebounce);
+      searchDebounce = setTimeout(() => {
+        renderHistoryList(listContainer, history, searchInput.value.trim().toLowerCase());
+      }, 150);
     });
   });
 }
@@ -794,7 +982,8 @@ function renderHistoryList(container, history, searchTerm) {
     const meta = document.createElement('div');
     meta.className = 'history-item-meta';
     const providers = (entry.providers || []).map(p => PROVIDERS[p]?.name || p).join(', ');
-    meta.textContent = `${formatTimestamp(entry.timestamp)}${providers ? ' \u00B7 ' + providers : ''}`;
+    const imgLabel = entry.imageCount ? ` \u00B7 ${entry.imageCount} image${entry.imageCount > 1 ? 's' : ''}` : '';
+    meta.textContent = `${formatTimestamp(entry.timestamp)}${imgLabel}${providers ? ' \u00B7 ' + providers : ''}`;
 
     const actions = document.createElement('div');
     actions.className = 'history-item-actions';
@@ -866,7 +1055,7 @@ function deleteHistoryEntry(timestamp, container) {
 }
 
 function formatTimestamp(ts) {
-  const diff = Date.now() - ts;
+  const diff = Math.max(0, Date.now() - ts);
   const mins = Math.floor(diff / 60000);
   if (mins < 1) return 'just now';
   if (mins < 60) return `${mins}m ago`;
