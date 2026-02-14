@@ -44,9 +44,19 @@ Mitigations:
 
 The extension uses `postMessage` for communication between the app page and AI provider iframes. Messages are validated for:
 - Origin (must be `chrome-extension://` for incoming messages to content script)
-- Message type (must match `MOSAIC_INJECT_PROMPT`)  
+- Target origin (messages sent to iframes use provider-specific origins, not wildcards)
+- Message type (must match `MOSAIC_INJECT_PROMPT`, `MOSAIC_EXTRACT_RESPONSE`, or `MOSAIC_READY`)
 - Provider field (must match current page's detected provider)
 - Prompt field (must be string, max 100KB)
+- Image payload (max 4 images, validated MIME type, max 14MB per image, must be data:image/ URL)
+
+**Image Handling (Low Risk)**
+
+Image attachments are converted to base64 data URLs client-side using FileReader. They are validated at two layers:
+- App page: MIME type allowlist (png/jpeg/gif/webp), 10MB size limit, max 4 images
+- Content script: Re-validates MIME type, size (14MB base64 ceiling), count, and data URL prefix
+
+Images are passed via `postMessage` and converted to File objects for synthetic paste/drop events. No images are stored persistently — they exist only for the duration of a single send operation.
 
 ## Security Review
 

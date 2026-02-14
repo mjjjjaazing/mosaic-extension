@@ -13,6 +13,9 @@ Thumbs.db
 node_modules/
 package-lock.json
 
+# Chrome extension metadata (auto-generated)
+_metadata/
+
 # Build artifacts
 *.zip
 *.crx

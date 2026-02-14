@@ -11,9 +11,10 @@ The extension stores the following data locally in `chrome.storage.local` (encry
 | Data | Purpose | Retention |
 |---|---|---|
 | Active providers list | Remember which AI panels to show | Until changed |
-| Layout preference | Remember grid layout choice | Until changed |
 | Sidebar state | Remember collapsed/expanded | Until changed |
-| Prompt history | Allow reuse of recent prompts | Last 50 entries; clearable |
+| Panel proportions | Remember custom panel resize ratios | Until reset |
+| Custom templates | Store user-created prompt templates | Until manually deleted (max 50) |
+| Prompt history | Allow reuse of recent prompts | Last 50 entries; clearable via UI |
 
 ## Data NOT Collected
 

@@ -39,11 +39,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     chrome.tabs.query({}, (tabs) => {
       for (const tab of tabs) {
         if (tab.url?.includes(domain)) {
-          chrome.tabs.sendMessage(tab.id, {
+          const msg = {
             type: 'MOSAIC_INJECT_PROMPT',
             provider: message.provider,
             prompt: message.prompt
-          }).catch(() => {});
+          };
+          if (Array.isArray(message.images) && message.images.length > 0) {
+            msg.images = message.images;
+          }
+          chrome.tabs.sendMessage(tab.id, msg).catch(() => {});
         }
       }
     });
