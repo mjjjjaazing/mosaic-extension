@@ -30,19 +30,86 @@ const IMAGE_ALLOWED_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp
 
 const providerReady = {};
 
+// ===== RESIZE STATE =====
+let panelProportions = {};
+
+const LAYOUT_HANDLE_CONFIG = {
+  1: { cols: 0, rows: 0 },
+  2: { cols: 1, rows: 0 },
+  3: { cols: 2, rows: 0 },
+  4: { cols: 1, rows: 1 },
+  6: { cols: 2, rows: 1 }
+};
+
+// ===== ONBOARDING STEPS =====
+const ONBOARDING_STEPS = [
+  {
+    id: 'send',
+    title: 'Send to All',
+    description: 'Type a prompt and send it to all active AI models simultaneously. Compare their responses side by side.',
+    target: '#sendBtn',
+    tooltipPosition: 'top'
+  },
+  {
+    id: 'images',
+    title: 'Image Attachments',
+    description: 'Paste, drag & drop, or click to attach images to your prompts. Supported across most AI providers.',
+    target: '#imageBtn',
+    tooltipPosition: 'top'
+  },
+  {
+    id: 'templates',
+    title: 'Prompt Templates',
+    description: 'Save frequently used prompts as templates. Type / in the prompt bar to quickly access them.',
+    target: '#templateBtn',
+    tooltipPosition: 'top'
+  },
+  {
+    id: 'export',
+    title: 'Export Responses',
+    description: 'Export all AI responses as a formatted Markdown document. Great for comparing and sharing results.',
+    target: '#exportAllBtn',
+    tooltipPosition: 'top'
+  },
+  {
+    id: 'synthesize',
+    title: 'Synthesize',
+    description: 'After receiving responses, use Synthesize to combine the best parts from all AIs into one comprehensive answer.',
+    target: '#synthesizeBtn',
+    tooltipPosition: 'top',
+    fallbackTarget: '#sendBtn'
+  },
+  {
+    id: 'history',
+    title: 'Prompt History',
+    description: 'Access your prompt history to resend or search previous prompts. Use Ctrl+Shift+H for quick access.',
+    target: '#historyBtn',
+    tooltipPosition: 'right'
+  }
+];
+
+let onboardingState = {
+  active: false,
+  currentStep: 0
+};
+
 // ===== INIT =====
 document.addEventListener('DOMContentLoaded', async () => {
   await loadState();
   await loadCustomTemplates();
+  await loadProportions();
   renderSidebar();
+  autoLayout();
   renderPanels();
   setupPromptBar();
-  setupLayoutButtons();
   setupSidebarToggle();
   setupFooterButtons();
   setupImageAttachments();
   setupHistoryButton();
+  setupSidebarToggleTab();
+  setupRichTooltips();
   listenForReadyMessages();
+  checkAndStartOnboarding();
 });
 
 // ===== STATE =====
@@ -89,11 +156,13 @@ function renderSidebar() {
   const list = document.getElementById('providerList');
   list.innerHTML = '';
   const sorted = Object.entries(PROVIDERS).sort((a, b) => a[1].order - b[1].order);
+  let idx = 0;
   for (const [id, p] of sorted) {
     const active = state.activeProviders.includes(id);
     const item = document.createElement('div');
     item.className = `provider-item ${active ? 'active' : ''}`;
     item.dataset.provider = id;
+    item.style.animation = `fadeIn 0.3s ${idx * 0.02}s both`;
 
     // SECURITY: Use DOM API instead of innerHTML to prevent XSS
     const iconDiv = document.createElement('div');
@@ -106,14 +175,14 @@ function renderSidebar() {
     nameDiv.textContent = p.name;
 
     const toggleDiv = document.createElement('div');
-    toggleDiv.className = 'toggle';
-    toggleDiv.textContent = active ? '\u2713' : '';
+    toggleDiv.className = 'provider-toggle-switch';
 
     item.appendChild(iconDiv);
     item.appendChild(nameDiv);
     item.appendChild(toggleDiv);
     item.addEventListener('click', () => toggleProvider(id));
     list.appendChild(item);
+    idx++;
   }
 }
 
@@ -131,36 +200,25 @@ function autoLayout() {
   else if (n === 3) state.layout = 3;
   else if (n <= 4) state.layout = 4;
   else state.layout = 6;
-  updateLayoutButtons();
 }
 
 // ===== LAYOUT =====
-function setupLayoutButtons() {
-  updateLayoutButtons();
-  document.querySelectorAll('.layout-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      state.layout = parseInt(btn.dataset.layout);
-      saveState(); updateLayoutButtons(); updateGridLayout();
-    });
-  });
-}
-function updateLayoutButtons() {
-  document.querySelectorAll('.layout-btn').forEach(btn =>
-    btn.classList.toggle('active', parseInt(btn.dataset.layout) === state.layout));
-}
 function updateGridLayout() {
-  document.getElementById('panelGrid').className = `panel-grid layout-${state.layout}`;
+  const grid = document.getElementById('panelGrid');
+  grid.className = `panel-grid layout-${state.layout}`;
+  grid.style.gridTemplateColumns = '';
+  grid.style.gridTemplateRows = '';
+  setupResizeHandles();
 }
 
 // ===== SIDEBAR TOGGLE =====
 function setupSidebarToggle() {
   const btn = document.getElementById('toggleSidebar');
   const sidebar = document.getElementById('sidebar');
-  if (state.sidebarCollapsed) { sidebar.classList.add('collapsed'); btn.textContent = '▶'; }
+  if (state.sidebarCollapsed) { sidebar.classList.add('collapsed'); }
   btn.addEventListener('click', () => {
     state.sidebarCollapsed = !state.sidebarCollapsed;
     sidebar.classList.toggle('collapsed');
-    btn.textContent = state.sidebarCollapsed ? '▶' : '◀';
     saveState();
   });
 }
@@ -176,6 +234,12 @@ function setupFooterButtons() {
     document.querySelectorAll('.panel iframe').forEach(f => { f.src = f.src; });
     removeSynthesizeButton();
   });
+  const helpBtn = document.getElementById('helpBtn');
+  if (helpBtn) {
+    helpBtn.addEventListener('click', () => {
+      startOnboarding();
+    });
+  }
 }
 
 // ===== PANELS =====
@@ -224,18 +288,24 @@ function renderPanels() {
     copyBtn.className = 'panel-action-btn';
     copyBtn.title = 'Copy response';
     copyBtn.textContent = '\uD83D\uDCCB';
+    copyBtn.setAttribute('data-tooltip-title', 'Copy Response');
+    copyBtn.setAttribute('data-tooltip-desc', 'Copy this AI\'s response to clipboard');
     copyBtn.addEventListener('click', () => copyPanelResponse(pid));
 
     const openBtn = document.createElement('button');
     openBtn.className = 'panel-action-btn';
     openBtn.title = 'Open in new tab';
     openBtn.textContent = '\u2197';
+    openBtn.setAttribute('data-tooltip-title', 'Open in Tab');
+    openBtn.setAttribute('data-tooltip-desc', 'Open this AI in a new browser tab');
     openBtn.addEventListener('click', () => window.open(p.url, '_blank'));
 
     const refreshBtn = document.createElement('button');
     refreshBtn.className = 'panel-action-btn';
     refreshBtn.title = 'Refresh';
     refreshBtn.textContent = '\u21BB';
+    refreshBtn.setAttribute('data-tooltip-title', 'Refresh');
+    refreshBtn.setAttribute('data-tooltip-desc', 'Reload this AI panel');
 
     headerActions.appendChild(copyBtn);
     headerActions.appendChild(openBtn);
@@ -255,6 +325,8 @@ function renderPanels() {
 
     refreshBtn.addEventListener('click', () => { iframe.src = iframe.src; });
   }
+
+  setupResizeHandles();
 }
 
 // ===== PROMPT BAR =====
@@ -775,9 +847,12 @@ function showSynthesizeButton() {
   const sendBtn = document.getElementById('sendBtn');
   const synthBtn = document.createElement('button');
   synthBtn.id = 'synthesizeBtn';
-  synthBtn.className = 'prompt-bar-btn synthesize-btn';
+  synthBtn.className = 'prompt-icon-btn';
   synthBtn.title = 'Synthesize best response';
-  synthBtn.textContent = '\u2697';
+  // Safe: hardcoded SVG with no user input
+  synthBtn.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2.5 7.5L22 12l-7.5 1.5L12 21l-2.5-7.5L2 12l7.5-1.5z"/></svg>';
+  synthBtn.setAttribute('data-tooltip-title', 'Synthesize');
+  synthBtn.setAttribute('data-tooltip-desc', 'Combine the best of all AI responses into one');
   synthBtn.addEventListener('click', showSynthesizeDialog);
   sendBtn.parentElement.insertBefore(synthBtn, sendBtn);
 }
@@ -1064,4 +1139,473 @@ function formatTimestamp(ts) {
   const days = Math.floor(hours / 24);
   if (days < 30) return `${days}d ago`;
   return new Date(ts).toLocaleDateString();
+}
+
+// ===== RESIZABLE PANELS =====
+function getColumnCount(layout) {
+  return { 1: 1, 2: 2, 3: 3, 4: 2, 6: 3 }[layout] || 1;
+}
+
+function getRowCount(layout) {
+  return { 1: 1, 2: 1, 3: 1, 4: 2, 6: 2 }[layout] || 1;
+}
+
+function getProportions(layout) {
+  const key = `layout_${layout}`;
+  if (panelProportions[key]) return panelProportions[key];
+  const cols = getColumnCount(layout);
+  const rows = getRowCount(layout);
+  return {
+    cols: Array(cols).fill(1 / cols),
+    rows: Array(rows).fill(1 / rows)
+  };
+}
+
+function applyProportions(layout) {
+  const grid = document.getElementById('panelGrid');
+  const props = getProportions(layout);
+  grid.style.gridTemplateColumns = props.cols.map(c => `${c}fr`).join(' ');
+  if (props.rows.length > 1) {
+    grid.style.gridTemplateRows = props.rows.map(r => `${r}fr`).join(' ');
+  }
+}
+
+function setupResizeHandles() {
+  removeResizeHandles();
+  const layout = state.layout;
+  const config = LAYOUT_HANDLE_CONFIG[layout];
+  if (!config || (config.cols === 0 && config.rows === 0)) return;
+
+  const grid = document.getElementById('panelGrid');
+  const props = getProportions(layout);
+
+  // Create column handles
+  let cumX = 0;
+  for (let i = 0; i < config.cols; i++) {
+    cumX += props.cols[i];
+    const handle = document.createElement('div');
+    handle.className = 'resize-handle resize-handle-col';
+    handle.dataset.index = i;
+    handle.dataset.type = 'col';
+    handle.style.left = `${cumX * 100}%`;
+    handle.addEventListener('mousedown', (e) => startResize(e, 'col', i));
+    handle.addEventListener('dblclick', () => resetProportions());
+    grid.appendChild(handle);
+  }
+
+  // Create row handles
+  let cumY = 0;
+  for (let i = 0; i < config.rows; i++) {
+    cumY += props.rows[i];
+    const handle = document.createElement('div');
+    handle.className = 'resize-handle resize-handle-row';
+    handle.dataset.index = i;
+    handle.dataset.type = 'row';
+    handle.style.top = `${cumY * 100}%`;
+    handle.addEventListener('mousedown', (e) => startResize(e, 'row', i));
+    handle.addEventListener('dblclick', () => resetProportions());
+    grid.appendChild(handle);
+  }
+
+  applyProportions(layout);
+}
+
+function removeResizeHandles() {
+  document.querySelectorAll('.resize-handle').forEach(h => h.remove());
+}
+
+function startResize(e, type, index) {
+  e.preventDefault();
+  const grid = document.getElementById('panelGrid');
+  const rect = grid.getBoundingClientRect();
+  const layout = state.layout;
+  const props = getProportions(layout);
+
+  // Create overlay to capture mouse events over iframes
+  const overlay = document.createElement('div');
+  overlay.className = `resize-overlay ${type}-resize`;
+  document.body.appendChild(overlay);
+  grid.classList.add('resizing');
+
+  const startX = e.clientX;
+  const startY = e.clientY;
+  const startProps = {
+    cols: [...props.cols],
+    rows: [...props.rows]
+  };
+
+  const onMove = (moveEvent) => {
+    if (type === 'col') {
+      const deltaRatio = (moveEvent.clientX - startX) / rect.width;
+      const newLeft = Math.max(0.1, startProps.cols[index] + deltaRatio);
+      const newRight = Math.max(0.1, startProps.cols[index + 1] - deltaRatio);
+      props.cols[index] = newLeft;
+      props.cols[index + 1] = newRight;
+    } else {
+      const deltaRatio = (moveEvent.clientY - startY) / rect.height;
+      const newTop = Math.max(0.1, startProps.rows[index] + deltaRatio);
+      const newBottom = Math.max(0.1, startProps.rows[index + 1] - deltaRatio);
+      props.rows[index] = newTop;
+      props.rows[index + 1] = newBottom;
+    }
+    applyProportions(layout);
+    positionHandles(layout);
+  };
+
+  const onEnd = () => {
+    overlay.remove();
+    grid.classList.remove('resizing');
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onEnd);
+
+    // Save proportions
+    const key = `layout_${layout}`;
+    panelProportions[key] = { cols: [...props.cols], rows: [...props.rows] };
+    saveProportions();
+  };
+
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onEnd);
+}
+
+function positionHandles(layout) {
+  const grid = document.getElementById('panelGrid');
+  const props = getProportions(layout);
+
+  const colHandles = grid.querySelectorAll('.resize-handle-col');
+  let cumX = 0;
+  colHandles.forEach((h, i) => {
+    cumX += props.cols[i];
+    h.style.left = `${cumX * 100}%`;
+  });
+
+  const rowHandles = grid.querySelectorAll('.resize-handle-row');
+  let cumY = 0;
+  rowHandles.forEach((h, i) => {
+    cumY += props.rows[i];
+    h.style.top = `${cumY * 100}%`;
+  });
+}
+
+function resetProportions() {
+  const layout = state.layout;
+  const key = `layout_${layout}`;
+  delete panelProportions[key];
+  const grid = document.getElementById('panelGrid');
+  grid.style.gridTemplateColumns = '';
+  grid.style.gridTemplateRows = '';
+  setupResizeHandles();
+  showToast('Panel sizes reset');
+  saveProportions();
+}
+
+function loadProportions() {
+  return new Promise(resolve => {
+    chrome.storage.local.get('panel_proportions', (data) => {
+      if (data.panel_proportions) {
+        Object.assign(panelProportions, data.panel_proportions);
+      }
+      resolve();
+    });
+  });
+}
+
+function saveProportions() {
+  chrome.storage.local.set({ panel_proportions: panelProportions }, () => {
+    if (chrome.runtime.lastError) console.error('Failed to save proportions:', chrome.runtime.lastError);
+  });
+}
+
+// Reposition handles on window resize
+window.addEventListener('resize', () => {
+  if (state.layout > 1) {
+    positionHandles(state.layout);
+  }
+});
+
+// ===== ONBOARDING TUTORIAL =====
+function checkAndStartOnboarding() {
+  chrome.storage.local.get('onboarding_completed', (data) => {
+    if (!data.onboarding_completed) {
+      setTimeout(() => startOnboarding(), 800);
+    }
+  });
+}
+
+function startOnboarding() {
+  onboardingState.active = true;
+  onboardingState.currentStep = 0;
+  renderOnboardingStep();
+  document.addEventListener('keydown', onboardingKeyHandler);
+}
+
+function onboardingKeyHandler(e) {
+  if (!onboardingState.active) return;
+  if (e.key === 'Escape') {
+    endOnboarding(false);
+  } else if (e.key === 'Enter' || e.key === 'ArrowRight') {
+    nextOnboardingStep();
+  }
+}
+
+function endOnboarding(completed = true) {
+  onboardingState.active = false;
+  document.removeEventListener('keydown', onboardingKeyHandler);
+
+  const spotlight = document.querySelector('.onboarding-spotlight');
+  const tooltip = document.querySelector('.onboarding-tooltip');
+  if (spotlight) spotlight.remove();
+  if (tooltip) tooltip.remove();
+
+  if (completed) {
+    chrome.storage.local.set({ onboarding_completed: true });
+    showToast('Tutorial complete! Replay anytime from the sidebar.');
+  }
+}
+
+function nextOnboardingStep() {
+  onboardingState.currentStep++;
+  if (onboardingState.currentStep >= ONBOARDING_STEPS.length) {
+    endOnboarding(true);
+  } else {
+    renderOnboardingStep();
+  }
+}
+
+function renderOnboardingStep() {
+  // Remove existing
+  const existingSpotlight = document.querySelector('.onboarding-spotlight');
+  const existingTooltip = document.querySelector('.onboarding-tooltip');
+  if (existingSpotlight) existingSpotlight.remove();
+  if (existingTooltip) existingTooltip.remove();
+
+  const step = ONBOARDING_STEPS[onboardingState.currentStep];
+  let targetEl = document.querySelector(step.target);
+  if (!targetEl && step.fallbackTarget) {
+    targetEl = document.querySelector(step.fallbackTarget);
+  }
+  if (!targetEl) {
+    nextOnboardingStep();
+    return;
+  }
+
+  const targetRect = targetEl.getBoundingClientRect();
+
+  // Create spotlight
+  const spotlight = document.createElement('div');
+  spotlight.className = 'onboarding-spotlight';
+  spotlight.style.left = `${targetRect.left - 4}px`;
+  spotlight.style.top = `${targetRect.top - 4}px`;
+  spotlight.style.width = `${targetRect.width + 8}px`;
+  spotlight.style.height = `${targetRect.height + 8}px`;
+  spotlight.addEventListener('click', () => endOnboarding(false));
+  document.body.appendChild(spotlight);
+
+  // Create tooltip
+  const tooltip = document.createElement('div');
+  tooltip.className = 'onboarding-tooltip';
+
+  const tooltipTitle = document.createElement('div');
+  tooltipTitle.className = 'onboarding-tooltip-title';
+  tooltipTitle.textContent = step.title;
+
+  const tooltipDesc = document.createElement('div');
+  tooltipDesc.className = 'onboarding-tooltip-desc';
+  tooltipDesc.textContent = step.description;
+
+  // Step dots
+  const dotsContainer = document.createElement('div');
+  dotsContainer.className = 'onboarding-step-dots';
+  for (let i = 0; i < ONBOARDING_STEPS.length; i++) {
+    const dot = document.createElement('div');
+    dot.className = 'onboarding-step-dot';
+    if (i === onboardingState.currentStep) dot.classList.add('active');
+    else if (i < onboardingState.currentStep) dot.classList.add('completed');
+    dotsContainer.appendChild(dot);
+  }
+
+  // Buttons
+  const btnContainer = document.createElement('div');
+  btnContainer.className = 'onboarding-btn-container';
+
+  const skipBtn = document.createElement('button');
+  skipBtn.className = 'onboarding-skip-btn';
+  skipBtn.textContent = 'Skip';
+  skipBtn.addEventListener('click', () => endOnboarding(false));
+
+  const nextBtn = document.createElement('button');
+  nextBtn.className = 'onboarding-next-btn';
+  nextBtn.textContent = onboardingState.currentStep === ONBOARDING_STEPS.length - 1 ? 'Done' : 'Next';
+  nextBtn.addEventListener('click', nextOnboardingStep);
+
+  btnContainer.appendChild(skipBtn);
+  btnContainer.appendChild(nextBtn);
+
+  tooltip.appendChild(tooltipTitle);
+  tooltip.appendChild(tooltipDesc);
+  tooltip.appendChild(dotsContainer);
+  tooltip.appendChild(btnContainer);
+
+  document.body.appendChild(tooltip);
+
+  // Position tooltip
+  positionOnboardingTooltip(tooltip, targetRect, step.tooltipPosition);
+
+  // Animate in
+  requestAnimationFrame(() => {
+    tooltip.classList.add('visible');
+  });
+}
+
+function positionOnboardingTooltip(tooltip, targetRect, position) {
+  const gap = 12;
+  const tooltipRect = tooltip.getBoundingClientRect();
+  let left, top;
+
+  switch (position) {
+    case 'top':
+      left = targetRect.left + targetRect.width / 2 - tooltipRect.width / 2;
+      top = targetRect.top - tooltipRect.height - gap;
+      break;
+    case 'bottom':
+      left = targetRect.left + targetRect.width / 2 - tooltipRect.width / 2;
+      top = targetRect.bottom + gap;
+      break;
+    case 'left':
+      left = targetRect.left - tooltipRect.width - gap;
+      top = targetRect.top + targetRect.height / 2 - tooltipRect.height / 2;
+      break;
+    case 'right':
+      left = targetRect.right + gap;
+      top = targetRect.top + targetRect.height / 2 - tooltipRect.height / 2;
+      break;
+  }
+
+  // Viewport clamping
+  left = Math.max(8, Math.min(left, window.innerWidth - tooltipRect.width - 8));
+  top = Math.max(8, Math.min(top, window.innerHeight - tooltipRect.height - 8));
+
+  tooltip.style.left = `${left}px`;
+  tooltip.style.top = `${top}px`;
+}
+
+// ===== SIDEBAR TOGGLE TAB =====
+function setupSidebarToggleTab() {
+  const tab = document.getElementById('sidebarToggleTab');
+  const sidebar = document.getElementById('sidebar');
+  if (!tab) return;
+
+  tab.addEventListener('click', () => {
+    state.sidebarCollapsed = !state.sidebarCollapsed;
+    sidebar.classList.toggle('collapsed');
+    saveState();
+  });
+}
+
+// ===== RICH TOOLTIPS =====
+function setupRichTooltips() {
+  let tooltipTimer = null;
+  let currentTooltip = null;
+  let currentTarget = null;
+
+  function showTooltipFor(el) {
+    const title = el.getAttribute('data-tooltip-title');
+    const desc = el.getAttribute('data-tooltip-desc');
+    if (!title) return;
+
+    removeCurrentTooltip();
+
+    const tooltip = document.createElement('div');
+    tooltip.className = 'rich-tooltip';
+
+    const titleEl = document.createElement('div');
+    titleEl.className = 'rich-tooltip-title';
+    titleEl.textContent = title;
+    tooltip.appendChild(titleEl);
+
+    if (desc) {
+      const descEl = document.createElement('div');
+      descEl.className = 'rich-tooltip-desc';
+      descEl.textContent = desc;
+      tooltip.appendChild(descEl);
+    }
+
+    document.body.appendChild(tooltip);
+    currentTooltip = tooltip;
+
+    // Position tooltip
+    const rect = el.getBoundingClientRect();
+    const tooltipRect = tooltip.getBoundingClientRect();
+
+    const inSidebar = el.closest('.sidebar');
+    const inPromptBar = el.closest('.prompt-bar');
+
+    let left, top;
+
+    if (inSidebar) {
+      // Position to the right of the sidebar element
+      left = rect.right + 8;
+      top = rect.top + rect.height / 2 - tooltipRect.height / 2;
+    } else if (inPromptBar) {
+      // Position above the prompt bar element
+      left = rect.left + rect.width / 2 - tooltipRect.width / 2;
+      top = rect.top - tooltipRect.height - 8;
+    } else {
+      // Default: above the element
+      left = rect.left + rect.width / 2 - tooltipRect.width / 2;
+      top = rect.top - tooltipRect.height - 8;
+    }
+
+    // Viewport clamping
+    left = Math.max(8, Math.min(left, window.innerWidth - tooltipRect.width - 8));
+    top = Math.max(8, Math.min(top, window.innerHeight - tooltipRect.height - 8));
+
+    tooltip.style.left = left + 'px';
+    tooltip.style.top = top + 'px';
+
+    requestAnimationFrame(() => {
+      tooltip.classList.add('visible');
+    });
+  }
+
+  function removeCurrentTooltip() {
+    if (currentTooltip) {
+      currentTooltip.remove();
+      currentTooltip = null;
+    }
+    currentTarget = null;
+  }
+
+  function clearTimer() {
+    if (tooltipTimer) {
+      clearTimeout(tooltipTimer);
+      tooltipTimer = null;
+    }
+  }
+
+  document.addEventListener('mouseover', (e) => {
+    const target = e.target.closest('[data-tooltip-title]');
+    if (!target || target === currentTarget) return;
+
+    clearTimer();
+    removeCurrentTooltip();
+    currentTarget = target;
+
+    tooltipTimer = setTimeout(() => {
+      if (onboardingState.active) return;
+      showTooltipFor(target);
+    }, 500);
+  });
+
+  document.addEventListener('mouseout', (e) => {
+    const target = e.target.closest('[data-tooltip-title]');
+    if (target) {
+      clearTimer();
+      removeCurrentTooltip();
+    }
+  });
+
+  // Hide on scroll or click
+  document.addEventListener('scroll', () => { clearTimer(); removeCurrentTooltip(); }, true);
+  document.addEventListener('mousedown', () => { clearTimer(); removeCurrentTooltip(); });
 }
