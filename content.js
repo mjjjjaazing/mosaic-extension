@@ -182,10 +182,34 @@
         insertViaExecCommand(input, prompt);
       }
       setTimeout(() => {
-        const btn = document.querySelector('.sendMessageButton, button[class*="sendMessage"]');
-        if (btn) btn.click();
+        clickZaiSendButton(input);
       }, 500);
     });
+  }
+
+  function clickZaiSendButton(inputEl) {
+    // Try multiple selectors — Z.ai's UI changes frequently
+    let btn = document.querySelector('.sendMessageButton, button[class*="sendMessage"]');
+    if (!btn) btn = document.querySelector('button[class*="send"], button[class*="Send"]');
+    if (!btn) btn = document.querySelector('button[aria-label*="Send"], button[aria-label*="send"]');
+    if (!btn) {
+      // Search all buttons for send-like attributes
+      const btns = Array.from(document.querySelectorAll('button'));
+      btn = btns.find(b => {
+        const cls = (b.className || '').toLowerCase();
+        const label = (b.getAttribute('aria-label') || '').toLowerCase();
+        const text = (b.textContent || '').trim().toLowerCase();
+        return cls.includes('send') || label.includes('send') || text === 'send';
+      });
+    }
+    if (btn && !btn.disabled) {
+      btn.click();
+    } else {
+      // Fallback: Enter key
+      if (inputEl) {
+        inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+      }
+    }
   }
 
   function injectKimi(prompt) {
@@ -308,6 +332,74 @@
     }
   }
 
+  // Insert text into element WITHOUT clearing existing content.
+  // Critical for image+text flow — insertViaExecCommand does selectAll+delete
+  // which would destroy any pasted image nodes in contenteditable editors.
+  function insertTextPreservingContent(element, text) {
+    element.focus();
+    if (element.tagName === 'TEXTAREA' || element.tagName === 'INPUT') {
+      // For textareas, images are in separate UI — safe to set value
+      insertIntoTextarea(element, text);
+    } else {
+      // For contenteditable: move cursor to end and insert without clearing
+      const sel = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      range.collapse(false); // collapse to end
+      sel.removeAllRanges();
+      sel.addRange(range);
+      document.execCommand('insertText', false, text);
+    }
+  }
+
+  // Provider-specific send button click with robust fallbacks.
+  // Used by injectImagesAndPrompt so it doesn't depend on injectPrompt's send logic.
+  function clickProviderSendButton(inputEl) {
+    switch (provider) {
+      case 'chatgpt': {
+        let btn = document.querySelector('button[data-testid="send-button"]');
+        if (!btn) btn = document.querySelector('button[aria-label="Send prompt"]');
+        if (!btn) btn = document.querySelector('button.composer-submit-button-color');
+        if (btn && !btn.disabled) { btn.click(); return; }
+        if (inputEl) inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+        return;
+      }
+      case 'gemini': {
+        const btn = document.querySelector('button.send-button, button[aria-label="Send message"]');
+        if (btn && !btn.disabled) { btn.click(); return; }
+        return;
+      }
+      case 'claude': {
+        const btns = Array.from(document.querySelectorAll('button'));
+        const btn = btns.find(b => (b.getAttribute('aria-label') || '').toLowerCase().includes('send'));
+        if (btn && !btn.disabled) { btn.click(); return; }
+        if (inputEl) inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+        return;
+      }
+      case 'grok': {
+        const btn = document.querySelector('button[aria-label="Submit"]');
+        if (btn && !btn.disabled) { btn.click(); return; }
+        return;
+      }
+      case 'zai': {
+        clickZaiSendButton(inputEl);
+        return;
+      }
+      case 'kimi': {
+        const sendBtn = document.querySelector('.send-button-container:not(.disabled)');
+        if (sendBtn) { sendBtn.click(); return; }
+        const svgBtn = document.querySelector('.send-button-container .send-icon');
+        if (svgBtn) { svgBtn.parentElement?.click(); return; }
+        if (inputEl) inputEl.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }));
+        return;
+      }
+      default:
+        // DeepSeek, Perplexity, Mistral, others
+        clickSendButton();
+        return;
+    }
+  }
+
   function injectImagesAndPrompt(images, prompt) {
     // Convert base64 data URLs to File objects
     const files = [];
@@ -332,14 +424,18 @@
         setTimeout(() => dispatchSyntheticDrop(dropTarget, files), 300);
       }
 
-      // Step 3: Wait for provider to process images, then inject text
-      const delay = 1500 + (files.length - 1) * 500;
+      // Step 3: Wait for provider to process images, then inject text + send.
+      // Use insertTextPreservingContent (NOT injectPrompt) to avoid
+      // selectAll+delete which would wipe pasted image nodes.
+      const delay = 2000 + (files.length - 1) * 500;
       setTimeout(() => {
         if (prompt) {
-          injectPrompt(prompt);
+          insertTextPreservingContent(inputEl, prompt);
+          // Give the editor time to register the text, then send
+          setTimeout(() => clickProviderSendButton(inputEl), 700);
         } else {
-          // No text, just click send
-          setTimeout(() => clickSendButton(), 600);
+          // Image-only, just click send
+          clickProviderSendButton(inputEl);
         }
       }, delay);
     });
